@@ -1523,7 +1523,7 @@ class BrightmonUploaderApp:
     def _run_esptool(self, port: str, baud: int, flash_files: list[tuple[str, Path]]) -> None:
         esptool_args = [
             "--chip",
-            "esp32",
+            "auto",
             "--port",
             port,
             "--baud",
@@ -1550,13 +1550,13 @@ class BrightmonUploaderApp:
 
         if "No module named esptool" in last_output:
             raise RuntimeError("esptool 모듈이 없습니다. 실행 중인 Python에 esptool을 설치하세요: python -m pip install esptool")
-        raise RuntimeError("esptool 업로드 실패. esptool 설치 여부와 포트 상태를 확인하세요.")
+        raise RuntimeError("esptool 업로드 실패. 보드 칩 종류, 포트, BOOT 모드, USB 연결 상태를 확인하세요.")
 
     def _run_erase_flash(self, port: str, baud: int) -> None:
         self._force_download_mode(port)
         esptool_args = [
             "--chip",
-            "esp32",
+            "auto",
             "--port",
             port,
             "--baud",
