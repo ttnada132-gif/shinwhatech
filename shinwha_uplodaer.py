@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
+import tkinter.font as tkfont
 
 try:
     import serial
@@ -315,6 +316,47 @@ def add_linux_uart_fallback_ports(ports: list[str]) -> None:
         path = Path(candidate)
         if path.exists() and candidate not in ports:
             ports.append(candidate)
+
+
+def choose_ui_font(root: tk.Tk) -> str:
+    available = set(tkfont.families(root))
+    if is_windows():
+        candidates = ("Malgun Gothic", "맑은 고딕", "Arial")
+    else:
+        candidates = (
+            "NanumGothic",
+            "Nanum Gothic",
+            "Noto Sans CJK KR",
+            "Noto Sans KR",
+            "UnDotum",
+            "DejaVu Sans",
+        )
+    for candidate in candidates:
+        if candidate in available:
+            return candidate
+    return "TkDefaultFont"
+
+
+def configure_default_fonts(root: tk.Tk) -> str:
+    family = choose_ui_font(root)
+    font_specs = {
+        "TkDefaultFont": 10,
+        "TkTextFont": 10,
+        "TkFixedFont": 10,
+        "TkMenuFont": 10,
+        "TkHeadingFont": 10,
+        "TkCaptionFont": 10,
+        "TkSmallCaptionFont": 9,
+        "TkIconFont": 10,
+        "TkTooltipFont": 9,
+    }
+    for font_name, size in font_specs.items():
+        try:
+            tkfont.nametofont(font_name).configure(family=family, size=size)
+        except tk.TclError:
+            pass
+    root.option_add("*Font", (family, 10))
+    return family
 
 
 def get_existing_settings_path() -> Path:
@@ -709,6 +751,7 @@ class BrightmonUploaderApp:
         self.remote_git_info: dict[str, str] | None = None
         self.update_blink_after_id: str | None = None
         self.update_blink_on = False
+        self.ui_font_family = configure_default_fonts(self.root)
 
         settings = load_settings()
         self.port_var = tk.StringVar(value=settings["port"])
@@ -754,9 +797,9 @@ class BrightmonUploaderApp:
         self.root.rowconfigure(0, weight=1)
 
         style = ttk.Style()
-        style.configure("Upload.TButton", font=("맑은 고딕", 15, "bold"), padding=(22, 12))
-        style.configure("Update.TButton", font=("맑은 고딕", 10, "bold"), padding=(10, 8))
-        style.configure("UpdateBlink.TButton", font=("맑은 고딕", 10, "bold"), padding=(10, 8), foreground="red")
+        style.configure("Upload.TButton", font=(self.ui_font_family, 15, "bold"), padding=(22, 12))
+        style.configure("Update.TButton", font=(self.ui_font_family, 10, "bold"), padding=(10, 8))
+        style.configure("UpdateBlink.TButton", font=(self.ui_font_family, 10, "bold"), padding=(10, 8), foreground="red")
 
         parent = ttk.Frame(self.root, padding=12)
         parent.grid(row=0, column=0, sticky="nsew")
@@ -925,7 +968,8 @@ class BrightmonUploaderApp:
         ttk.Button(log_header, text="로그 지우기", command=self.clear_log).grid(
             row=0, column=4, sticky="e", padx=(6, 0)
         )
-        self.log_text = tk.Text(parent, height=16, wrap="word", state="disabled", font=("Consolas", 10))
+        log_font = "Consolas" if is_windows() else self.ui_font_family
+        self.log_text = tk.Text(parent, height=16, wrap="word", state="disabled", font=(log_font, 10))
         self.log_text.grid(row=5, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(parent, orient="vertical", command=self.log_text.yview)
         scroll.grid(row=5, column=1, sticky="ns")
