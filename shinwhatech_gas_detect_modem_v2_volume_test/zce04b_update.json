@@ -1,0 +1,18 @@
+{
+  "source_commit": "7c0ec6c2edaa903edac8bbea5eaba641ee12aad8",
+  "changed_zce04b_sources": 9,
+  "sampling_interval_ms": 1000,
+  "sample_count_per_gas": 5,
+  "gases": [
+    "CO",
+    "H2S",
+    "O2",
+    "CH4"
+  ],
+  "alarm_values": "Mean of five valid samples; existing thresholds and oxygen low/high limits preserved.",
+  "startup": "Gas alarms start after five valid snapshots; no zero padding.",
+  "telemetry": "Raw values retained for displays and payloads; threshold decisions use averages.",
+  "validation": "49 extracted real sensor parsers and available alarm predicates passed native mock-UART tests; four production firmware builds passed.",
+  "hardware_tested": false,
+  "firmware": "Unchanged: active main.cpp is an audio-only volume test with no ZCE04B. Sensor example sources updated in patch."
+}
