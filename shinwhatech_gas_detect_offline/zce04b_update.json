@@ -1,0 +1,18 @@
+{
+  "source_commit": "b0d4cc630820aec3fb44a2ff81218ac75fa5f710",
+  "changed_zce04b_sources": 10,
+  "sampling_interval_ms": 1000,
+  "sample_count_per_gas": 5,
+  "gases": [
+    "CO",
+    "H2S",
+    "O2",
+    "CH4"
+  ],
+  "alarm_values": "Mean of five valid samples; existing thresholds and oxygen low/high limits preserved.",
+  "startup": "Gas alarms start after five valid snapshots; no zero padding.",
+  "telemetry": "Raw values retained for displays and payloads; threshold decisions use averages.",
+  "validation": "49 extracted real sensor parsers and available alarm predicates passed native mock-UART tests; four production firmware builds passed.",
+  "hardware_tested": false,
+  "firmware_sha256": "4cf29bc95140cceca749b6ceca67a806ae40d9c08a3d613202e8844e259829c4"
+}
