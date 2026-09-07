@@ -1,0 +1,1657 @@
+diff --git a/include/ZceGasSamples.h b/include/ZceGasSamples.h
+new file mode 100644
+index 0000000..959ffb2
+--- /dev/null
++++ b/include/ZceGasSamples.h
+@@ -0,0 +1,39 @@
++#pragma once
++#include <stdint.h>
++
++// One validated snapshot per second, with five samples for each ZCE04B gas.
++class ZceGasSamples {
++ public:
++  enum Gas { CO, H2S, O2, CH4, GAS_COUNT };
++  static constexpr uint32_t SAMPLE_INTERVAL_MS = 1000;
++  static constexpr uint8_t SAMPLE_COUNT = 5;
++
++  bool sampleDue(uint32_t nowMs) {
++    if (uint32_t(nowMs - lastSampleMs_) < SAMPLE_INTERVAL_MS) return false;
++    lastSampleMs_ = nowMs;
++    return true;
++  }
++
++  void reset() { next_ = 0; count_ = 0; }
++
++  void add(float co, float h2s, float o2, float ch4) {
++    const float values[GAS_COUNT] = {co, h2s, o2, ch4};
++    for (uint8_t gas = 0; gas < GAS_COUNT; ++gas) samples_[gas][next_] = values[gas];
++    next_ = (next_ + 1) % SAMPLE_COUNT;
++    if (count_ < SAMPLE_COUNT) ++count_;
++  }
++
++  bool ready() const { return count_ == SAMPLE_COUNT; }
++  float average(Gas gas) const {
++    if (count_ == 0) return 0.0f;
++    float total = 0.0f;
++    for (uint8_t i = 0; i < count_; ++i) total += samples_[gas][i];
++    return total / count_;
++  }
++
++ private:
++  float samples_[GAS_COUNT][SAMPLE_COUNT] = {};
++  uint32_t lastSampleMs_ = 0;
++  uint8_t next_ = 0;
++  uint8_t count_ = 0;
++};
+diff --git a/origin.cpp b/origin.cpp
+index 0321d02..c1912c1 100644
+--- a/origin.cpp
++++ b/origin.cpp
+@@ -1,3 +1,6 @@
++#include "include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -658,6 +661,8 @@ uint8_t zceChecksum(const uint8_t* b, size_t len) {
+ 
+ // 프레임 1개 파싱 성공하면 true
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   // 시리얼 버퍼에서 0xFF(스타트) 맞춰서 읽기
+   while (gasSerial.available() > 0) {
+     // start byte 찾기
+@@ -667,11 +672,11 @@ bool readZCE04B() {
+     }
+ 
+     // 프레임 길이만큼 안 쌓였으면 다음 loop에서
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11바이트 읽기
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     // 기본 검증
+     if (zceFrame[0] != 0xFF) continue;
+@@ -697,10 +702,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //다른 센서 버전 
+@@ -741,7 +747,22 @@ unsigned long lastUpdate = 0;
+ unsigned long siren_timer=millis();
+ unsigned long siren_music_loop=millis();
+ int count_sos=0;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+   int sos_btn = (digitalRead(sos_pin) == LOW) ? 1 : 0;
+   if (sos_btn == 1 and sosState==0) {//눌림
+     count_sos++;
+@@ -784,9 +805,9 @@ void loop() {
+     }
+   }
+  
+-  if (millis() - lastUpdate >= 5000) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+   
+@@ -801,7 +822,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val <= 18.0) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) <= 18.0)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -812,12 +833,12 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: 산소부족
++            playSampledSensorAlert(3);   // 0003.mp3: 산소부족
+             //play_music();
+           }
+           else if (co2_val >= 4000.0 ||
+-            ch4_val >= 10 || co_val >= 50.0 ||
+-            h2s_val>=10  ) {
++            (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 10) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 50.0) ||
++            (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 10)  ) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -827,7 +848,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: 유해가스감지
++            playSampledSensorAlert(5);   // 0005.mp3: 유해가스감지
+             //play_music();
+           }  
+           else if (temperature >= 31 ) {
+@@ -840,7 +861,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:고온
++            playSampledSensorAlert(4);   // 0004.mp3:고온
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -853,7 +874,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:저온
++            playSampledSensorAlert(2);   // 0002.mp3:저온
+             //play_music();
+           }
+           else if (batteryVoltage <= 30 ) {
+@@ -866,7 +887,7 @@ void loop() {
+             }
+             if(millis()-battery_check_time>=300000){//5분에 한번
+               battery_check_time=millis();
+-              JQ6500_playByIndex(9);   // 0009.mp3:저전압
++              playSampledSensorAlert(9);   // 0009.mp3:저전압
+             }
+             //play_music();
+           }
+diff --git a/src/main.cpp b/src/main.cpp
+index e1c22a3..77e7a30 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,4 +1,7 @@
+-﻿#include <Arduino.h>
++﻿#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
++#include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+ #include <EthernetENC.h>
+@@ -2957,21 +2960,21 @@ bool sendToServerAndRemember() {
+ bool isGasDangerAlertCondition() {
+   return
+       (co2_val >= 15000.0f) ||
+-      (ch4_val >= 1.5f) ||
+-      (o2_val < 19.5f) ||
+-      (o2_val > 23.6f) ||
+-      (co_val >= 60.0f) ||
+-      (h2s_val >= 20.0f);
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f));
+ }
+ 
+ bool shouldSendToServerForThreshold() {
+   return
+       (co2_val >= serverSendThresholds.co2) ||
+-      (ch4_val >= serverSendThresholds.ch4) ||
+-      (o2_val < serverSendThresholds.o2Low) ||
+-      (o2_val > serverSendThresholds.o2High) ||
+-      (co_val >= serverSendThresholds.co) ||
+-      (h2s_val >= serverSendThresholds.h2s) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > serverSendThresholds.o2High)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= serverSendThresholds.co)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= serverSendThresholds.h2s)) ||
+       (temperature >= serverSendThresholds.tempHigh) ||
+       (temperature <= serverSendThresholds.tempLow);
+ }
+@@ -3147,6 +3150,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -3154,6 +3158,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -3167,6 +3172,8 @@ void calibrateAllGasInCleanAir() {
+ }
+ 
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+   // ?�리??버퍼?�서 0xFF(?��??? 맞춰???�기
+   while (gasSerial.available() > 0) {
+@@ -3177,11 +3184,11 @@ bool readZCE04B() {
+     }
+ 
+     // ?�레??길이만큼 ???��??�면 ?�음 loop?�서
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11바이???�기
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     // 기본 검�?    
+     if (zceFrame[0] != 0xFF) continue;
+@@ -3206,10 +3213,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //?�른 ?�서 버전 
+@@ -3261,7 +3269,22 @@ void readSCD41() {
+ // 측정 주기
+ unsigned long lastUpdate = 0;
+ bool sensorSnapshotReady = false;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+   handleSerialConfigInput();
+   const uint32_t nowMs = millis();
+ 
+@@ -3305,9 +3328,9 @@ void loop() {
+   }
+   serviceSosSequence(nowMs);
+  
+-  if (millis() - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+     bool gasDangerAlert = false;
+@@ -3319,7 +3342,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val < 19.5f || o2_val > 23.6f) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -3330,13 +3353,13 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: ?�소부�?            //play_music();
++            playSampledSensorAlert(3);   // 0003.mp3: ?�소부�?            //play_music();
+           }
+           else if (
+             (co2_val >=15000.0f) ||
+-            (ch4_val >= 1.5f) ||
+-            (co_val >= 60.0f) ||
+-            (h2s_val >= 20.0f)
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f))
+           ) {
+             warn = true;
+             
+@@ -3347,7 +3370,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: ?�해가?�감지
++            playSampledSensorAlert(5);   // 0005.mp3: ?�해가?�감지
+             //play_music();
+           }  
+           else if (temperature >= 99 ) {
+@@ -3360,7 +3383,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:고온
++            playSampledSensorAlert(4);   // 0004.mp3:고온
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -3373,7 +3396,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:?�??            //play_music();
++            playSampledSensorAlert(2);   // 0002.mp3:?�??            //play_music();
+           }
+           else if (batteryVoltage <= 10 ) {
+             warn = true;
+@@ -3385,7 +3408,7 @@ void loop() {
+             }
+             if (battery_check_time == 0 || nowMs - battery_check_time >= LOW_BATTERY_ALERT_INTERVAL_MS) {
+               battery_check_time = nowMs;
+-              JQ6500_playByIndex(9);   // 0009.mp3:?�?�압
++              playSampledSensorAlert(9);   // 0009.mp3:?�?�압
+             }
+             //play_music();
+           }
+diff --git a/test/broad_cast_only.cpp b/test/broad_cast_only.cpp
+index 4564d98..062b7fb 100644
+--- a/test/broad_cast_only.cpp
++++ b/test/broad_cast_only.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -1818,21 +1821,21 @@ bool sendToServerAndRemember() {
+ bool isGasDangerAlertCondition() {
+   return
+       (co2_val >= 15000.0f) ||
+-      (ch4_val >= 1.5f) ||
+-      (o2_val < 19.5f) ||
+-      (o2_val > 23.6f) ||
+-      (co_val >= 60.0f) ||
+-      (h2s_val >= 20.0f);
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f));
+ }
+ 
+ bool shouldSendToServerForThreshold() {
+   return
+       (co2_val >= serverSendThresholds.co2) ||
+-      (ch4_val >= serverSendThresholds.ch4) ||
+-      (o2_val < serverSendThresholds.o2Low) ||
+-      (o2_val > serverSendThresholds.o2High) ||
+-      (co_val >= serverSendThresholds.co) ||
+-      (h2s_val >= serverSendThresholds.h2s) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > serverSendThresholds.o2High)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= serverSendThresholds.co)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= serverSendThresholds.h2s)) ||
+       (temperature >= serverSendThresholds.tempHigh) ||
+       (temperature <= serverSendThresholds.tempLow);
+ }
+@@ -2005,6 +2008,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -2012,6 +2016,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -2026,6 +2031,8 @@ void calibrateAllGasInCleanAir() {
+ 
+ // ?�레??1�??�싱 ?�공?�면 true
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+   // ?�리??버퍼?�서 0xFF(?��??? 맞춰???�기
+   while (gasSerial.available() > 0) {
+@@ -2036,11 +2043,11 @@ bool readZCE04B() {
+     }
+ 
+     // ?�레??길이만큼 ???��??�면 ?�음 loop?�서
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11바이???�기
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     // 기본 검�?
+     if (zceFrame[0] != 0xFF) continue;
+@@ -2066,10 +2073,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //?�른 ?�서 버전 
+@@ -2121,7 +2129,22 @@ void readSCD41() {
+ // 측정 주기
+ unsigned long lastUpdate = 0;
+ bool sensorSnapshotReady = false;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+ #if ETHERNET_USE_DHCP
+   if (netMode == ETHERNET_MODE) {
+     if (!ethernetUsingStaticIp) {
+@@ -2146,9 +2169,9 @@ void loop() {
+   }
+   serviceSosSequence(nowMs);
+  
+-  if (millis() - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+     bool gasDangerAlert = false;
+@@ -2160,7 +2183,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val < 19.5f || o2_val > 23.6f) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -2171,14 +2194,14 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: ?�소부�?
++            playSampledSensorAlert(3);   // 0003.mp3: ?�소부�?
+             //play_music();
+           }
+           else if (
+             (co2_val >=15000.0f) ||
+-            (ch4_val >= 1.5f) ||
+-            (co_val >= 60.0f) ||
+-            (h2s_val >= 20.0f)
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f))
+           ) {
+             warn = true;
+             
+@@ -2189,7 +2212,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: ?�해가?�감지
++            playSampledSensorAlert(5);   // 0005.mp3: ?�해가?�감지
+             //play_music();
+           }  
+           else if (temperature >= 99 ) {
+@@ -2202,7 +2225,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:고온
++            playSampledSensorAlert(4);   // 0004.mp3:고온
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -2215,7 +2238,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:?�??
++            playSampledSensorAlert(2);   // 0002.mp3:?�??
+             //play_music();
+           }
+           else if (batteryVoltage <= 10 ) {
+@@ -2228,7 +2251,7 @@ void loop() {
+             }
+             if (battery_check_time == 0 || nowMs - battery_check_time >= LOW_BATTERY_ALERT_INTERVAL_MS) {
+               battery_check_time = nowMs;
+-              JQ6500_playByIndex(9);   // 0009.mp3:?�?�압
++              playSampledSensorAlert(9);   // 0009.mp3:?�?�압
+             }
+             //play_music();
+           }
+diff --git a/test/calibration.cpp b/test/calibration.cpp
+index df69fc5..a34ce3d 100644
+--- a/test/calibration.cpp
++++ b/test/calibration.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <EthernetENC.h>
+ #include <EthernetUdp.h>
+@@ -115,6 +118,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -122,6 +126,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -159,6 +164,8 @@ void handleSerialCommand() {
+ }
+ 
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   while (gasSerial.available() > 0) {
+     if (gasSerial.peek() != 0xFF) {
+       gasSerial.read();
+@@ -166,12 +173,12 @@ bool readZCE04B() {
+     }
+ 
+     if (gasSerial.available() < ZCE_FRAME_LEN) {
+-      return false;
++      break;
+     }
+ 
+     const size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+     if (n != ZCE_FRAME_LEN) {
+-      return false;
++      break;
+     }
+ 
+     if (zceFrame[0] != 0xFF || zceFrame[1] != 0x86) {
+@@ -193,18 +200,19 @@ bool readZCE04B() {
+     o2_val = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);        // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ bool isGasDanger() {
+-  return o2_val < 19.5f ||
+-         o2_val > 23.6f ||
+-         ch4_val >= 1.5f ||
+-         co_val >= 60.0f ||
+-         h2s_val >= 20.0f;
++  return (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) ||
++         (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f) ||
++         (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f) ||
++         (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f) ||
++         (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f);
+ }
+ 
+ void printGasValues() {
+diff --git a/test/dhcp_ethernet.cpp b/test/dhcp_ethernet.cpp
+index 4dd3dee..f665499 100644
+--- a/test/dhcp_ethernet.cpp
++++ b/test/dhcp_ethernet.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -3182,21 +3185,21 @@ bool sendToServerAndRemember() {
+ bool isGasDangerAlertCondition() {
+   return
+       (co2_val >= 15000.0f) ||
+-      (ch4_val >= 1.5f) ||
+-      (o2_val < 19.5f) ||
+-      (o2_val > 23.6f) ||
+-      (co_val >= 60.0f) ||
+-      (h2s_val >= 20.0f);
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f));
+ }
+ 
+ bool shouldSendToServerForThreshold() {
+   return
+       (co2_val >= serverSendThresholds.co2) ||
+-      (ch4_val >= serverSendThresholds.ch4) ||
+-      (o2_val < serverSendThresholds.o2Low) ||
+-      (o2_val > serverSendThresholds.o2High) ||
+-      (co_val >= serverSendThresholds.co) ||
+-      (h2s_val >= serverSendThresholds.h2s) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > serverSendThresholds.o2High)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= serverSendThresholds.co)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= serverSendThresholds.h2s)) ||
+       (temperature >= serverSendThresholds.tempHigh) ||
+       (temperature <= serverSendThresholds.tempLow);
+ }
+@@ -3369,6 +3372,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -3376,6 +3380,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -3390,6 +3395,8 @@ void calibrateAllGasInCleanAir() {
+ 
+ // ?�레??1�??�싱 ?�공?�면 true
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+   // ?�리??버퍼?�서 0xFF(?��??? 맞춰???�기
+   while (gasSerial.available() > 0) {
+@@ -3400,11 +3407,11 @@ bool readZCE04B() {
+     }
+ 
+     // ?�레??길이만큼 ???��??�면 ?�음 loop?�서
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11바이???�기
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     // 기본 검�?
+     if (zceFrame[0] != 0xFF) continue;
+@@ -3430,10 +3437,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //?�른 ?�서 버전 
+@@ -3485,7 +3493,22 @@ void readSCD41() {
+ // 측정 주기
+ unsigned long lastUpdate = 0;
+ bool sensorSnapshotReady = false;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+ #if ETHERNET_USE_DHCP
+   if (netMode == ETHERNET_MODE) {
+     if (!ethernetUsingStaticIp) {
+@@ -3511,9 +3534,9 @@ void loop() {
+   }
+   serviceSosSequence(nowMs);
+  
+-  if (millis() - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+     bool gasDangerAlert = false;
+@@ -3525,7 +3548,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val < 19.5f || o2_val > 23.6f) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -3536,14 +3559,14 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: ?�소부�?
++            playSampledSensorAlert(3);   // 0003.mp3: ?�소부�?
+             //play_music();
+           }
+           else if (
+             (co2_val >=15000.0f) ||
+-            (ch4_val >= 1.5f) ||
+-            (co_val >= 60.0f) ||
+-            (h2s_val >= 20.0f)
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f))
+           ) {
+             warn = true;
+             
+@@ -3554,7 +3577,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: ?�해가?�감지
++            playSampledSensorAlert(5);   // 0005.mp3: ?�해가?�감지
+             //play_music();
+           }  
+           else if (temperature >= 99 ) {
+@@ -3567,7 +3590,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:고온
++            playSampledSensorAlert(4);   // 0004.mp3:고온
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -3580,7 +3603,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:?�??
++            playSampledSensorAlert(2);   // 0002.mp3:?�??
+             //play_music();
+           }
+           else if (batteryVoltage <= 10 ) {
+@@ -3593,7 +3616,7 @@ void loop() {
+             }
+             if (battery_check_time == 0 || nowMs - battery_check_time >= LOW_BATTERY_ALERT_INTERVAL_MS) {
+               battery_check_time = nowMs;
+-              JQ6500_playByIndex(9);   // 0009.mp3:?�?�압
++              playSampledSensorAlert(9);   // 0009.mp3:?�?�압
+             }
+             //play_music();
+           }
+diff --git a/test/offline.cpp b/test/offline.cpp
+index 713fd0a..84b24b2 100644
+--- a/test/offline.cpp
++++ b/test/offline.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <LiquidCrystal_I2C.h>
+@@ -397,6 +400,8 @@ uint8_t zceChecksum(const uint8_t* buf, size_t len) {
+ }
+ 
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+ 
+   while (gasSerial.available() > 0) {
+@@ -405,10 +410,10 @@ bool readZCE04B() {
+       continue;
+     }
+ 
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     if (zceFrame[0] != 0xFF || zceFrame[1] != 0x86) continue;
+     if (zceChecksum(zceFrame, ZCE_FRAME_LEN) != zceFrame[10]) continue;
+@@ -422,10 +427,11 @@ bool readZCE04B() {
+     h2s_val = static_cast<float>(h2sRaw);
+     o2_val = static_cast<float>(o2Raw) * 0.1f;
+     ch4_val = static_cast<float>(ch4Raw);
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ void readSCD41() {
+@@ -480,41 +486,55 @@ void updateDisplay() {
+   lcd.print(line);
+ }
+ 
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void serviceAlerts() {
+   bool warn = false;
+ 
+   if (!sosState) {
+     digitalWrite(SIREN_LED_PIN, LOW);
+ 
+-    if (o2_val < O2_LOW_THRESHOLD || o2_val > O2_HIGH_THRESHOLD) {
++    if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < O2_LOW_THRESHOLD) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > O2_HIGH_THRESHOLD)) {
+       warn = true;
+       digitalWrite(SIREN_LED_PIN, HIGH);
+       ensureAlertVolume();
+-      JQ6500_playByIndex(3);
++      playSampledSensorAlert(3);
+     } else if (co2_val >= CO2_HIGH_THRESHOLD ||
+-               ch4_val >= CH4_HIGH_THRESHOLD ||
+-               co_val >= CO_HIGH_THRESHOLD ||
+-               h2s_val >= H2S_HIGH_THRESHOLD) {
++               (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= CH4_HIGH_THRESHOLD) ||
++               (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= CO_HIGH_THRESHOLD) ||
++               (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= H2S_HIGH_THRESHOLD)) {
+       warn = true;
+       digitalWrite(SIREN_LED_PIN, HIGH);
+       ensureAlertVolume();
+-      JQ6500_playByIndex(5);
++      playSampledSensorAlert(5);
+     } else if (temperature >= TEMP_HIGH_THRESHOLD) {
+       warn = true;
+       digitalWrite(SIREN_LED_PIN, HIGH);
+       ensureAlertVolume();
+-      JQ6500_playByIndex(4);
++      playSampledSensorAlert(4);
+     } else if (temperature < TEMP_LOW_THRESHOLD) {
+       warn = true;
+       digitalWrite(SIREN_LED_PIN, HIGH);
+       ensureAlertVolume();
+-      JQ6500_playByIndex(2);
++      playSampledSensorAlert(2);
+     } else if (batteryPercent <= BATTERY_LOW_THRESHOLD) {
+       warn = true;
+       ensureAlertVolume();
+       if (batteryCheckMs == 0 || millis() - batteryCheckMs >= BATTERY_ALERT_INTERVAL_MS) {
+         batteryCheckMs = millis();
+-        JQ6500_playByIndex(9);
++        playSampledSensorAlert(9);
+       }
+     }
+   }
+@@ -567,6 +587,7 @@ void setup() {
+ }
+ 
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+   const uint32_t nowMs = millis();
+ 
+   bool sosButtonPressed = (digitalRead(SOS_PIN) == LOW);
+@@ -586,8 +607,8 @@ void loop() {
+ 
+   serviceSosSequence(nowMs);
+ 
+-  if ((nowMs - lastUpdateMs) >= SENSOR_ALERT_REPEAT_MS) {
+-    readZCE04B();
++  if ((nowMs - lastUpdateMs) >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
++
+     readSCD41();
+     batteryPercent = readBatteryVoltage();
+     serviceAlerts();
+diff --git a/test/only_ethernet.cpp b/test/only_ethernet.cpp
+index 8ca228d..a530f61 100644
+--- a/test/only_ethernet.cpp
++++ b/test/only_ethernet.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -480,6 +483,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -487,6 +491,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -500,9 +505,11 @@ void calibrateAllGasInCleanAir() {
+ }
+ 
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   while (gasSerial.available() > 0) {
+     if (gasSerial.peek() != 0xFF) { gasSerial.read(); continue; }
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+     gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+     if (zceFrame[0] != 0xFF || zceFrame[1] != 0x86) continue;
+     if (zceChecksum(zceFrame, ZCE_FRAME_LEN) != zceFrame[10]) continue;
+@@ -510,9 +517,10 @@ bool readZCE04B() {
+     h2s_val = float((uint16_t(zceFrame[4]) << 8) | zceFrame[5]);
+     o2_val  = float((uint16_t(zceFrame[6]) << 8) | zceFrame[7]) * 0.1f;
+     ch4_val = float((uint16_t(zceFrame[8]) << 8) | zceFrame[9]);
+-    return true;
++    received = true;
+   }
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ void readSCD41() {
+@@ -938,6 +946,7 @@ unsigned long lastServerSendMs = 0;
+ bool firstSend = true;
+ 
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+   handleSerialConfigInput();
+   const uint32_t nowMs = millis();
+   
+@@ -952,8 +961,8 @@ void loop() {
+   serviceSosSequence(nowMs);
+ 
+   // Sensor Reading & LCD Update
+-  if (nowMs - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
+-    readZCE04B(); readSCD41();
++  if (nowMs - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
++     readSCD41();
+     batteryVoltage = readBatteryVoltage();
+     
+     if (hasLcd) {
+@@ -976,7 +985,7 @@ void loop() {
+   // Periodic Sending
+   if (netMode == ETHERNET_MODE) {
+     bool periodic = (nowMs - lastServerSendMs >= SERVER_SEND_PERIODIC_INTERVAL_MS);
+-    bool threshold = (co2_val >= serverSendThresholds.co2 || ch4_val >= serverSendThresholds.ch4 || o2_val < serverSendThresholds.o2Low); // simplified
++    bool threshold = (co2_val >= serverSendThresholds.co2 || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)); // simplified
+     if ((firstSend || periodic || threshold || sosState == 1) && (nowMs - lastServerSendMs >= SERVER_SEND_MIN_INTERVAL_MS)) {
+       if (sendToServer()) {
+         lastServerSendMs = nowMs; firstSend = false;
+diff --git a/test/origin.cpp b/test/origin.cpp
+index bd4705b..8a4c299 100644
+--- a/test/origin.cpp
++++ b/test/origin.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -2859,21 +2862,21 @@ bool sendToServerAndRemember() {
+ bool isGasDangerAlertCondition() {
+   return
+       (co2_val >= 15000.0f) ||
+-      (ch4_val >= 1.5f) ||
+-      (o2_val < 19.5f) ||
+-      (o2_val > 23.6f) ||
+-      (co_val >= 60.0f) ||
+-      (h2s_val >= 20.0f);
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f));
+ }
+ 
+ bool shouldSendToServerForThreshold() {
+   return
+       (co2_val >= serverSendThresholds.co2) ||
+-      (ch4_val >= serverSendThresholds.ch4) ||
+-      (o2_val < serverSendThresholds.o2Low) ||
+-      (o2_val > serverSendThresholds.o2High) ||
+-      (co_val >= serverSendThresholds.co) ||
+-      (h2s_val >= serverSendThresholds.h2s) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > serverSendThresholds.o2High)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= serverSendThresholds.co)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= serverSendThresholds.h2s)) ||
+       (temperature >= serverSendThresholds.tempHigh) ||
+       (temperature <= serverSendThresholds.tempLow);
+ }
+@@ -3049,6 +3052,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -3056,6 +3060,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -3069,6 +3074,8 @@ void calibrateAllGasInCleanAir() {
+ }
+ 
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+   // 시리얼 버퍼에서 0xFF(스타트) 맞춰서 읽기
+   while (gasSerial.available() > 0) {
+@@ -3079,11 +3086,11 @@ bool readZCE04B() {
+     }
+ 
+     // 프레임 길이만큼 안 쌓였으면 다음 loop에서
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11바이트 읽기
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     // 기본 검증
+     if (zceFrame[0] != 0xFF) continue;
+@@ -3109,10 +3116,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //다른 센서 버전 
+@@ -3164,7 +3172,22 @@ void readSCD41() {
+ // 측정 주기
+ unsigned long lastUpdate = 0;
+ bool sensorSnapshotReady = false;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+   handleSerialConfigInput();
+   const uint32_t nowMs = millis();
+ 
+@@ -3208,9 +3231,9 @@ void loop() {
+   }
+   serviceSosSequence(nowMs);
+  
+-  if (millis() - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+     bool gasDangerAlert = false;
+@@ -3222,7 +3245,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val < 19.5f || o2_val > 23.6f) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -3233,14 +3256,14 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: 산소부족
++            playSampledSensorAlert(3);   // 0003.mp3: 산소부족
+             //play_music();
+           }
+           else if (
+             (co2_val >=15000.0f) ||
+-            (ch4_val >= 1.5f) ||
+-            (co_val >= 60.0f) ||
+-            (h2s_val >= 20.0f)
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f))
+           ) {
+             warn = true;
+             
+@@ -3251,7 +3274,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: 유해가스감지
++            playSampledSensorAlert(5);   // 0005.mp3: 유해가스감지
+             //play_music();
+           }  
+           else if (temperature >= 99 ) {
+@@ -3264,7 +3287,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:고온
++            playSampledSensorAlert(4);   // 0004.mp3:고온
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -3277,7 +3300,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:저온
++            playSampledSensorAlert(2);   // 0002.mp3:저온
+             //play_music();
+           }
+           else if (batteryVoltage <= 10 ) {
+@@ -3290,7 +3313,7 @@ void loop() {
+             }
+             if (battery_check_time == 0 || nowMs - battery_check_time >= LOW_BATTERY_ALERT_INTERVAL_MS) {
+               battery_check_time = nowMs;
+-              JQ6500_playByIndex(9);   // 0009.mp3:저전압
++              playSampledSensorAlert(9);   // 0009.mp3:저전압
+             }
+             //play_music();
+           }
+diff --git a/test/static_test.cpp b/test/static_test.cpp
+index a03b3ea..5c2ad94 100644
+--- a/test/static_test.cpp
++++ b/test/static_test.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -3288,21 +3291,21 @@ bool sendToServerAndRemember() {
+ bool isGasDangerAlertCondition() {
+   return
+       (co2_val >= 15000.0f) ||
+-      (ch4_val >= 1.5f) ||
+-      (o2_val < 19.5f) ||
+-      (o2_val > 23.6f) ||
+-      (co_val >= 60.0f) ||
+-      (h2s_val >= 20.0f);
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f));
+ }
+ 
+ bool shouldSendToServerForThreshold() {
+   return
+       (co2_val >= serverSendThresholds.co2) ||
+-      (ch4_val >= serverSendThresholds.ch4) ||
+-      (o2_val < serverSendThresholds.o2Low) ||
+-      (o2_val > serverSendThresholds.o2High) ||
+-      (co_val >= serverSendThresholds.co) ||
+-      (h2s_val >= serverSendThresholds.h2s) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > serverSendThresholds.o2High)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= serverSendThresholds.co)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= serverSendThresholds.h2s)) ||
+       (temperature >= serverSendThresholds.tempHigh) ||
+       (temperature <= serverSendThresholds.tempLow);
+ }
+@@ -3475,6 +3478,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -3482,6 +3486,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -3496,6 +3501,8 @@ void calibrateAllGasInCleanAir() {
+ 
+ // ?꾨젅??1�????�� ?깃났??�㈃ true
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+   // ??�━??踰꾪??�?�� 0xFF(????? 留욎?????�린
+   while (gasSerial.available() > 0) {
+@@ -3506,11 +3513,11 @@ bool readZCE04B() {
+     }
+ 
+     // ?꾨젅??湲몄?�留?�겮 ???�???�㈃ ??�쓬 loop?�?��
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11諛붿?????�린
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+     // 湲곕??寃�?
+     if (zceFrame[0] != 0xFF) continue;
+@@ -3536,10 +3543,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //??�Ⅸ ??�꽌 踰꾩??
+@@ -3591,7 +3599,22 @@ void readSCD41() {
+ // 痢≪??二쇨�?
+ unsigned long lastUpdate = 0;
+ bool sensorSnapshotReady = false;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+ #if ETHERNET_ENABLE_DHCP_FALLBACK
+   if (netMode == ETHERNET_MODE) {
+     if (!ethernetUsingStaticIp) {
+@@ -3616,9 +3639,9 @@ void loop() {
+   }
+   serviceSosSequence(nowMs);
+  
+-  if (millis() - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+     bool gasDangerAlert = false;
+@@ -3630,7 +3653,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val < 19.5f || o2_val > 23.6f) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -3641,14 +3664,14 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: ?곗냼?��?
++            playSampledSensorAlert(3);   // 0003.mp3: ?곗냼?��?
+             //play_music();
+           }
+           else if (
+             (co2_val >=15000.0f) ||
+-            (ch4_val >= 1.5f) ||
+-            (co_val >= 60.0f) ||
+-            (h2s_val >= 20.0f)
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f))
+           ) {
+             warn = true;
+             
+@@ -3659,7 +3682,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: ?좏빐媛??�컧吏
++            playSampledSensorAlert(5);   // 0005.mp3: ?좏빐媛??�컧吏
+             //play_music();
+           }  
+           else if (temperature >= 99 ) {
+@@ -3672,7 +3695,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:?�좎??
++            playSampledSensorAlert(4);   // 0004.mp3:?�좎??
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -3685,7 +3708,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:????
++            playSampledSensorAlert(2);   // 0002.mp3:????
+             //play_music();
+           }
+           else if (batteryVoltage <= 10 ) {
+@@ -3698,7 +3721,7 @@ void loop() {
+             }
+             if (battery_check_time == 0 || nowMs - battery_check_time >= LOW_BATTERY_ALERT_INTERVAL_MS) {
+               battery_check_time = nowMs;
+-              JQ6500_playByIndex(9);   // 0009.mp3:???꾩븬
++              playSampledSensorAlert(9);   // 0009.mp3:???꾩븬
+             }
+             //play_music();
+           }
+diff --git a/test/wifi_version.cpp b/test/wifi_version.cpp
+index b357059..975d582 100644
+--- a/test/wifi_version.cpp
++++ b/test/wifi_version.cpp
+@@ -1,3 +1,6 @@
++#include "../include/ZceGasSamples.h"
++static ZceGasSamples zceGasSamples;
++
+ #include <Arduino.h>
+ #include <Wire.h>
+ #include <SPI.h>
+@@ -3066,21 +3069,21 @@ bool sendToServerAndRemember() {
+ bool isGasDangerAlertCondition() {
+   return
+       (co2_val >= 15000.0f) ||
+-      (ch4_val >= 1.5f) ||
+-      (o2_val < 19.5f) ||
+-      (o2_val > 23.6f) ||
+-      (co_val >= 60.0f) ||
+-      (h2s_val >= 20.0f);
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f));
+ }
+ 
+ bool shouldSendToServerForThreshold() {
+   return
+       (co2_val >= serverSendThresholds.co2) ||
+-      (ch4_val >= serverSendThresholds.ch4) ||
+-      (o2_val < serverSendThresholds.o2Low) ||
+-      (o2_val > serverSendThresholds.o2High) ||
+-      (co_val >= serverSendThresholds.co) ||
+-      (h2s_val >= serverSendThresholds.h2s) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= serverSendThresholds.ch4)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < serverSendThresholds.o2Low)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > serverSendThresholds.o2High)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= serverSendThresholds.co)) ||
++      ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= serverSendThresholds.h2s)) ||
+       (temperature >= serverSendThresholds.tempHigh) ||
+       (temperature <= serverSendThresholds.tempLow);
+ }
+@@ -3254,6 +3257,7 @@ void calibrateZceZero(const char* gasName, const uint8_t* switchCommand) {
+ }
+ 
+ void calibrateO2AirSpan20_9() {
++  zceGasSamples.reset();
+   Serial.println("O2 air span calibration start");
+   switchZceGas(ZCE_SWITCH_TO_O2);
+   sendZceCommand(ZCE_O2_AIR_SPAN_20_9, ZCE_CMD_LEN);
+@@ -3261,6 +3265,7 @@ void calibrateO2AirSpan20_9() {
+ }
+ 
+ void calibrateAllGasInCleanAir() {
++  zceGasSamples.reset();
+   Serial.println("All gas calibration start");
+   Serial.println("Keep the sensor in clean normal air. Target: O2=20.9%, CO=0ppm, H2S=0ppm, CH4=0%LEL");
+ 
+@@ -3274,6 +3279,8 @@ void calibrateAllGasInCleanAir() {
+ }
+ 
+ bool readZCE04B() {
++  if (!zceGasSamples.sampleDue(millis())) return false;
++  bool received = false;
+   selectGasUart();
+   // ?�리??버퍼?�서 0xFF(?��??? 맞춰???�기
+   while (gasSerial.available() > 0) {
+@@ -3284,15 +3291,17 @@ bool readZCE04B() {
+     }
+ 
+     // ?�레??길이만큼 ???��??�면 ?�음 loop?�서
+-    if (gasSerial.available() < ZCE_FRAME_LEN) return false;
++    if (gasSerial.available() < ZCE_FRAME_LEN) break;
+ 
+     // 11바이???�기
+     size_t n = gasSerial.readBytes(zceFrame, ZCE_FRAME_LEN);
+-    if (n != ZCE_FRAME_LEN) return false;
++    if (n != ZCE_FRAME_LEN) break;
+ 
+-    // 기본 검�?    if (zceFrame[0] != 0xFF) continue;
++    // 기본 검�?
++    if (zceFrame[0] != 0xFF) continue;
+     if (zceFrame[1] != 0x86) continue; // active upload ?�이???�레??
+-    // 체크??검�?    uint8_t chk = zceChecksum(zceFrame, ZCE_FRAME_LEN);
++    // 체크??검�?
++    uint8_t chk = zceChecksum(zceFrame, ZCE_FRAME_LEN);
+     if (chk != zceFrame[10]) {
+       // ?�레???�?�졌?�면 ?�음 0xFF�??�시 찾도�?계속 진행
+       continue;
+@@ -3311,10 +3320,11 @@ bool readZCE04B() {
+     o2_val  = float(o2_raw) * 0.1f;   // %vol
+     ch4_val = float(ch4_raw);         // %LEL
+ 
+-    return true;
++    received = true;
+   }
+ 
+-  return false;
++  if (received) zceGasSamples.add(co_val, h2s_val, o2_val, ch4_val);
++  return received;
+ }
+ 
+ // void readZCE04B() {  //?�른 ?�서 버전 
+@@ -3366,7 +3376,22 @@ void readSCD41() {
+ // 측정 주기
+ unsigned long lastUpdate = 0;
+ bool sensorSnapshotReady = false;
++// Sampling and alarm evaluation run each second; audio repeats every five seconds.
++void playSampledSensorAlert(uint8_t track) {
++  static bool played = false;
++  static uint8_t lastTrack = 0;
++  static uint32_t lastPlaybackMs = 0;
++  const uint32_t nowMs = millis();
++  if (!played || track != lastTrack || uint32_t(nowMs - lastPlaybackMs) >= 5000) {
++    JQ6500_playByIndex(track);
++    played = true;
++    lastTrack = track;
++    lastPlaybackMs = nowMs;
++  }
++}
++
+ void loop() {
++  readZCE04B();  // Independent 1-second gas sampling, before slower alert/network work.
+   handleSerialConfigInput();
+   const uint32_t nowMs = millis();
+ 
+@@ -3385,9 +3410,9 @@ void loop() {
+   }
+   serviceSosSequence(nowMs);
+  
+-  if (millis() - lastUpdate >= SENSOR_ALERT_REPEAT_MS) {
++  if (millis() - lastUpdate >= ZceGasSamples::SAMPLE_INTERVAL_MS) {
+     
+-  readZCE04B();
++
+   readSCD41();
+     bool warn = false;
+     bool gasDangerAlert = false;
+@@ -3399,7 +3424,7 @@ void loop() {
+     if(sosState==0){
+       
+             digitalWrite(siren_led, LOW);
+-      if (o2_val < 19.5f || o2_val > 23.6f) {
++      if ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) < 19.5f) || (zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::O2) > 23.6f)) {
+             warn = true;
+             
+             digitalWrite(siren_led, HIGH);
+@@ -3410,13 +3435,13 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(3);   // 0003.mp3: ?�소부�?            //play_music();
++            playSampledSensorAlert(3);   // 0003.mp3: ?�소부�?            //play_music();
+           }
+           else if (
+             (co2_val >=15000.0f) ||
+-            (ch4_val >= 1.5f) ||
+-            (co_val >= 60.0f) ||
+-            (h2s_val >= 20.0f)
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CH4) >= 1.5f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::CO) >= 60.0f)) ||
++            ((zceGasSamples.ready() && zceGasSamples.average(ZceGasSamples::H2S) >= 20.0f))
+           ) {
+             warn = true;
+             
+@@ -3427,7 +3452,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(5);   // 0005.mp3: ?�해가?�감지
++            playSampledSensorAlert(5);   // 0005.mp3: ?�해가?�감지
+             //play_music();
+           }  
+           else if (temperature >= 99 ) {
+@@ -3440,7 +3465,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(4);   // 0004.mp3:고온
++            playSampledSensorAlert(4);   // 0004.mp3:고온
+             //play_music();
+           }
+           else if (temperature <-10 ) {
+@@ -3453,7 +3478,7 @@ void loop() {
+               delay(300);
+ 
+             }
+-            JQ6500_playByIndex(2);   // 0002.mp3:?�??            //play_music();
++            playSampledSensorAlert(2);   // 0002.mp3:?�??            //play_music();
+           }
+           else if (batteryVoltage <= 10 ) {
+             warn = true;
+@@ -3465,7 +3490,7 @@ void loop() {
+             }
+             if (battery_check_time == 0 || nowMs - battery_check_time >= LOW_BATTERY_ALERT_INTERVAL_MS) {
+               battery_check_time = nowMs;
+-              JQ6500_playByIndex(9);   // 0009.mp3:?�?�압
++              playSampledSensorAlert(9);   // 0009.mp3:?�?�압
+             }
+             //play_music();
+           }
